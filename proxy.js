@@ -256,7 +256,6 @@ function startServer(config) {
 
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${body.length}b)`);
-      if (reqNum === 1) { try { fs.writeFileSync('/tmp/openclaw-request-raw.json', Buffer.concat(chunks).toString('utf8')); fs.writeFileSync('/tmp/openclaw-request-processed.json', bodyStr); console.log(`[${ts}] #${reqNum} dumped raw+processed bodies to /tmp/`); } catch(e) {} }
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
