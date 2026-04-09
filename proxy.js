@@ -29,6 +29,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { StringDecoder } = require('string_decoder');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
@@ -700,16 +701,27 @@ function startServer(config) {
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           res.writeHead(status, upRes.headers);
           const TAIL_SIZE = 64;
+          // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks.
+          // chunk.toString() would emit U+FFFD whenever a multi-byte char (中文,
+          // emoji, etc.) lands on a chunk boundary.
+          const decoder = new StringDecoder('utf8');
           let pending = '';
           upRes.on('data', (chunk) => {
-            pending += chunk.toString();
+            pending += decoder.write(chunk);
             if (pending.length > TAIL_SIZE) {
-              const flushable = pending.slice(0, pending.length - TAIL_SIZE);
-              pending = pending.slice(pending.length - TAIL_SIZE);
+              let sliceIdx = pending.length - TAIL_SIZE;
+              // Don't cut between a UTF-16 surrogate pair (4-byte UTF-8 chars
+              // like emoji), or flushable would end with a lone high surrogate
+              // that the downstream client can't recombine.
+              const prev = pending.charCodeAt(sliceIdx - 1);
+              if (prev >= 0xD800 && prev <= 0xDBFF) sliceIdx -= 1;
+              const flushable = pending.slice(0, sliceIdx);
+              pending = pending.slice(sliceIdx);
               res.write(reverseMap(flushable, config));
             }
           });
           upRes.on('end', () => {
+            pending += decoder.end();
             if (pending.length > 0) {
               res.write(reverseMap(pending, config));
             }
