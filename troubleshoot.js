@@ -347,6 +347,58 @@ async function runTests() {
     }
   }
 
+  // ─── 9. OpenClaw Configuration Check ───────────────────────────────────────
+  console.log('\n9. Checking OpenClaw configuration...\n');
+
+  const ocConfigPaths = [
+    path.join(os.homedir(), '.openclaw', 'openclaw.json'),
+    path.join(os.homedir(), '.openclaw', 'config.json')
+  ];
+
+  let ocConfigFound = false;
+  for (const ocPath of ocConfigPaths) {
+    if (fs.existsSync(ocPath)) {
+      try {
+        const ocRaw = fs.readFileSync(ocPath, 'utf8');
+        const ocConfig = JSON.parse(ocRaw.charCodeAt(0) === 0xFEFF ? ocRaw.slice(1) : ocRaw);
+        ocConfigFound = true;
+
+        const baseUrl = ocConfig.models &&
+          ocConfig.models.providers &&
+          ocConfig.models.providers.anthropic &&
+          ocConfig.models.providers.anthropic.baseUrl;
+
+        if (baseUrl) {
+          if (baseUrl.includes('127.0.0.1:18801') || baseUrl.includes('localhost:18801')) {
+            ok('OpenClaw baseUrl points to proxy', baseUrl);
+          } else if (baseUrl.includes('127.0.0.1') || baseUrl.includes('localhost')) {
+            info('OpenClaw baseUrl: ' + baseUrl + ' (custom port -- make sure proxy is on that port)');
+          } else {
+            fail('OpenClaw baseUrl is NOT pointing to the proxy', baseUrl);
+            info('Change models.providers.anthropic.baseUrl to "http://127.0.0.1:18801" in ' + ocPath);
+            info('Then restart the OpenClaw gateway.');
+            info('');
+            info('Note: ANTHROPIC_BASE_URL env var does NOT control OpenClaw routing.');
+            info('You must set baseUrl in openclaw.json under models.providers.anthropic.');
+          }
+        } else {
+          fail('No baseUrl found in OpenClaw config', 'OpenClaw is using the default Anthropic API directly');
+          info('Add this to ' + ocPath + ':');
+          info('  "models": { "providers": { "anthropic": { "baseUrl": "http://127.0.0.1:18801" } } }');
+          info('Then restart the OpenClaw gateway.');
+        }
+      } catch(e) {
+        info('Found ' + ocPath + ' but failed to parse: ' + e.message);
+      }
+      break;
+    }
+  }
+
+  if (!ocConfigFound) {
+    info('OpenClaw config not found at ~/.openclaw/openclaw.json');
+    info('(This check only works if OpenClaw is installed on this machine)');
+  }
+
   // ─── Summary ──────────────────────────────────────────────────────────────
   console.log('\n---------------------------------');
   console.log('  Results: ' + passed + ' passed, ' + failed + ' failed');
