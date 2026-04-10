@@ -8,3 +8,8 @@ troubleshoot.js
 node_modules/
 .env
 .env.*
+plans
+docs
+scripts/proxy.pid
+scripts/proxy.log
+logs

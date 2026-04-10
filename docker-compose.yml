@@ -2,6 +2,7 @@ services:
   proxy:
     build: .
     image: openclaw-billing-proxy:latest
+    container_name: openclaw-billing-proxy
     restart: unless-stopped
     ports:
       # IMPORTANT: 127.0.0.1 ensures proxy is only accessible locally
