@@ -30,11 +30,22 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
+const metricsLib = require('./proxy-metrics');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
-const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.2.3';
+// Upstream host + port. Production always points at api.anthropic.com over
+// HTTPS/443. The PROXY_UPSTREAM_HOST / PROXY_UPSTREAM_PORT env vars exist
+// only to let integration tests redirect at a local mock — do not document
+// them in user-facing docs.
+const UPSTREAM_HOST = process.env.PROXY_UPSTREAM_HOST || 'api.anthropic.com';
+const UPSTREAM_PORT = Number(process.env.PROXY_UPSTREAM_PORT) || 443;
+const UPSTREAM_SCHEME = process.env.PROXY_UPSTREAM_SCHEME || 'https';
+const VERSION = '2.2.5';
+
+// Upstream idle-socket timeout (ms). 10 min accommodates extended-thinking
+// streams while bounding hung connections.
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 600_000;
 
 // Claude Code version to emulate (update when new CC versions are released)
 const CC_VERSION = '2.1.97';
@@ -43,9 +54,38 @@ const CC_VERSION = '2.1.97';
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 
-// Persistent per-instance identifiers (generated once at startup)
-const DEVICE_ID = crypto.randomBytes(32).toString('hex');
+// Persistent per-host identifier. Real Claude Code CLI reuses the same
+// device_id across process launches — regenerating it on every restart is a
+// distinguishing signal Anthropic's abuse detection could pick up on. We
+// cache the value in ~/.claude/proxy-device.json (same dir as credentials)
+// and only generate on first run or if the file is corrupted.
+const DEVICE_ID = loadOrCreateDeviceId();
+
+// Instance session ID DOES regenerate per launch — mirrors a fresh CC CLI
+// process.
 const INSTANCE_SESSION_ID = crypto.randomUUID();
+
+function loadOrCreateDeviceId() {
+  const storePath = path.join(os.homedir(), '.claude', 'proxy-device.json');
+  try {
+    if (fs.existsSync(storePath)) {
+      const parsed = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+      if (parsed && typeof parsed.deviceId === 'string' && /^[0-9a-f]{64}$/.test(parsed.deviceId)) {
+        return parsed.deviceId;
+      }
+    }
+  } catch (_) { /* fall through, regenerate */ }
+  const id = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, JSON.stringify({ deviceId: id, createdAt: new Date().toISOString() }), { mode: 0o600 });
+  } catch (e) {
+    // Best-effort persistence. If the home dir is read-only (unusual Docker
+    // configs), stay session-scoped rather than crash the proxy.
+    console.error('[PROXY] Warning: could not persist device id:', e.message);
+  }
+  return id;
+}
 
 // Beta flags required for OAuth + Claude Code features
 const REQUIRED_BETAS = [
@@ -60,11 +100,18 @@ const REQUIRED_BETAS = [
 ];
 
 // CC tool stubs -- injected into tools array to make the tool set look more
-// like a Claude Code session. The model won't call these (schemas are minimal).
+// like a Claude Code session.
+//
+// WARNING: Only include stubs the model is unlikely to call. Stubs with
+// semantically appealing names (e.g. "Agent" for spawning subagents) get
+// invoked by the model but have no local implementation, producing "tool not
+// found" errors with no reverse mapping available. The previously-included
+// "Agent" stub caused infinite retry loops in subagent orchestration flows
+// because the real subagent tool is the renamed `subagents` -> `AgentControl`
+// and `create_task` -> `TaskCreate`, not the phantom `Agent`.
 const CC_TOOL_STUBS = [
   '{"name":"Glob","description":"Find files by pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"}},"required":["pattern"]}}',
   '{"name":"Grep","description":"Search file contents","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Search path"}},"required":["pattern"]}}',
-  '{"name":"Agent","description":"Launch a subagent for complex tasks","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Task description"}},"required":["prompt"]}}',
   '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
   '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
@@ -403,6 +450,13 @@ function loadConfig() {
     console.log(`[PROXY] Note: config.json has ${config.toolRenames.length} toolRenames, merged with ${DEFAULT_TOOL_RENAMES.length} defaults -> ${toolRenames.length} total`);
   }
 
+  // Upstream socket idle timeout. Matches x-stainless-timeout=600 so long
+  // thinking streams aren't cut short, but unbounded hangs release sockets.
+  // 0 or negative disables (useful only for tests).
+  const upstreamTimeoutMs = Number.isFinite(config.upstreamTimeoutMs)
+    ? config.upstreamTimeoutMs
+    : DEFAULT_UPSTREAM_TIMEOUT_MS;
+
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
@@ -413,7 +467,8 @@ function loadConfig() {
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
-    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
+    upstreamTimeoutMs
   };
 }
 
@@ -660,10 +715,11 @@ function processBody(bodyStr, config) {
       else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
     }
     m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
-  } else {
+  } else if (m.length > 0 && m[0] === '{') {
     // Insert after opening brace
     m = '{' + metaJson + ',' + m.slice(1);
   }
+  // else: malformed body — don't splice, let upstream return its own error
 
   // Layer 8: Strip trailing assistant prefill (raw string, no JSON.parse)
   // Opus 4.6 disabled assistant message prefill. OpenClaw sometimes pre-fills the
@@ -740,21 +796,23 @@ function reverseMap(text, config) {
 
 // ─── Server ─────────────────────────────────────────────────────────────────
 function startServer(config) {
-  let requestCount = 0;
-  const startedAt = Date.now();
+  const metrics = metricsLib.createMetrics();
 
   const server = http.createServer((req, res) => {
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const oauth = getToken(config.credsPath);
         const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+        const snap = metricsLib.snapshot(metrics);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           status: expiresIn > 0 ? 'ok' : 'token_expired',
           proxy: 'openclaw-billing-proxy',
           version: VERSION,
-          requestsServed: requestCount,
-          uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
+          requestsServed: snap.requests,
+          detections: snap.detections,
+          detectionRate: snap.detectionRate,
+          uptime: snap.uptimeSeconds + 's',
           tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
           subscriptionType: oauth.subscriptionType,
           layers: {
@@ -767,14 +825,21 @@ function startServer(config) {
           }
         }));
       } catch (e) {
+        metricsLib.recordTokenReadError(metrics);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'error', message: e.message }));
       }
       return;
     }
 
-    requestCount++;
-    const reqNum = requestCount;
+    if (req.url === '/metrics' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(metricsLib.snapshot(metrics), null, 2));
+      return;
+    }
+
+    metricsLib.recordRequest(metrics, Number(req.headers['content-length']) || 0);
+    const reqNum = metrics.requests;
     const chunks = [];
 
     req.on('data', c => chunks.push(c));
@@ -782,6 +847,7 @@ function startServer(config) {
       let body = Buffer.concat(chunks);
       let oauth;
       try { oauth = getToken(config.credsPath); } catch (e) {
+        metricsLib.recordTokenReadError(metrics);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
         return;
@@ -819,9 +885,15 @@ function startServer(config) {
       const ts = new Date().toISOString().substring(11, 19);
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
 
-      const upstream = https.request({
-        hostname: UPSTREAM_HOST, port: 443,
-        path: req.url, method: req.method, headers
+      // Test hook: `http` for plaintext mock servers; production is always `https`.
+      const upstreamLib = UPSTREAM_SCHEME === 'http' ? http : https;
+      const upstream = upstreamLib.request({
+        hostname: UPSTREAM_HOST, port: UPSTREAM_PORT,
+        path: req.url, method: req.method, headers,
+        // Idle-socket timeout (no bytes from Anthropic in this window).
+        // Matches x-stainless-timeout=600 so streaming "thinking" responses
+        // don't get cut short, but hung connections eventually release.
+        timeout: config.upstreamTimeoutMs
       }, (upRes) => {
         const status = upRes.statusCode;
         console.log(`[${ts}] #${reqNum} > ${status}`);
@@ -830,7 +902,9 @@ function startServer(config) {
           upRes.on('data', c => errChunks.push(c));
           upRes.on('end', () => {
             let errBody = Buffer.concat(errChunks).toString();
-            if (errBody.includes('extra usage')) {
+            metricsLib.recordResponse(metrics, status, errBody.length);
+            if (metricsLib.isDetection(status, errBody)) {
+              metricsLib.recordDetection(metrics, reqNum, body.length, errBody);
               console.error(`[${ts}] #${reqNum} DETECTION! Body: ${body.length}b`);
             }
             errBody = reverseMap(errBody, config);
@@ -842,15 +916,28 @@ function startServer(config) {
           });
           return;
         }
-        // SSE streaming — event-aware reverseMap. Buffer until a complete SSE
-        // event arrives (terminated by \n\n), then transform per event. This
-        // subsumes the older tail-buffer fix for patterns split across TCP
-        // chunks (#11) because SSE events are self-contained, so patterns
-        // can't span event boundaries. It also lets us track the current
-        // content block type across events and pass thinking/redacted_thinking
-        // bytes through unchanged — Anthropic rejects the next turn otherwise
-        // with "thinking blocks in the latest assistant message cannot be
-        // modified."
+        // 2xx path — count it. Body size is captured per chunk in the SSE
+        // handler; for non-SSE 2xx we tally in the respChunks 'end' below.
+        metricsLib.recordResponse(metrics, status, 0);
+        // SSE streaming — event-aware reverseMap with cross-event content
+        // buffering. Events are self-contained at the SSE framing level
+        // (terminated by \n\n), but the CONTENT inside `input_json_delta` /
+        // `text_delta` events is intentionally a streaming partial value:
+        // the model can split a single sanitized token (e.g. `ocplatform`)
+        // across consecutive deltas. Per-event reverseMap misses those
+        // splits, leaving sanitized tokens in tool args — client then tries
+        // to read `.ocplatform/` paths that don't exist. (issue: cross-event
+        // reverse-map split)
+        //
+        // Fix: per content-block accumulator. For non-thinking blocks we
+        // accumulate the raw delta value, run reverseMap on the full buffer,
+        // and emit only a "safe prefix" (holding back HOLDBACK chars so any
+        // pattern still being streamed has a chance to complete). On
+        // content_block_stop we flush the remaining reversed tail as a final
+        // synthetic delta before forwarding the stop event.
+        //
+        // Thinking/redacted_thinking blocks still pass through byte-identical
+        // (Anthropic enforces byte-equality on the latest assistant message).
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
           const sseHeaders = { ...upRes.headers };
           delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
@@ -861,7 +948,44 @@ function startServer(config) {
           // don't decode as U+FFFD.
           const decoder = new StringDecoder('utf8');
           let pending = '';
-          let currentBlockIsThinking = false;
+
+          // Per-content-block state keyed by index. Tracks accumulated raw
+          // JSON-escaped delta bytes, how many reversed chars we've already
+          // emitted, and the delta field name (partial_json vs text).
+          const blockStates = new Map();
+
+          // Holdback: max pattern length across all reverseable tables, in
+          // both plain and escaped forms. A pattern crossing the emit/hold
+          // boundary won't be matched until the next delta arrives.
+          const HOLDBACK = (() => {
+            let max = 0;
+            for (const [k] of config.reverseMap) max = Math.max(max, k.length);
+            // toolRenames/propRenames apply reversed in both "Name" and \"Name\" forms
+            for (const [, cc] of config.toolRenames) max = Math.max(max, cc.length + 4);
+            for (const [, renamed] of config.propRenames) max = Math.max(max, renamed.length + 4);
+            return max;
+          })();
+
+          // Extract "partial_json" or "text" field value from an SSE data
+          // line. Returns { key, value } where value is the raw JSON-escaped
+          // string bytes between the quotes. Regex matches escape sequences
+          // (\\.) or plain non-quote-non-backslash chars.
+          const extractDeltaValue = (dataStr) => {
+            const m = dataStr.match(/"(partial_json|text)":"((?:\\.|[^"\\])*)"/);
+            return m ? { key: m[1], value: m[2] } : null;
+          };
+
+          // Pick a split point within `reversed` that doesn't leave a dangling
+          // JSON escape (odd number of trailing backslashes). The client's
+          // JSON parse on the aggregated delta stream would choke otherwise.
+          const safeSplitPoint = (reversed, candidate, floor) => {
+            let safe = Math.max(floor, candidate);
+            let trailing = 0;
+            while (safe - trailing - 1 >= floor && reversed[safe - trailing - 1] === '\\') trailing++;
+            if (trailing % 2 === 1) safe--;
+            if (safe < floor) safe = floor;
+            return safe;
+          };
 
           const transformEvent = (event) => {
             // Locate the data: line (always at the start of an SSE line)
@@ -873,24 +997,68 @@ function startServer(config) {
               ? event.slice(dataIdx + 6)
               : event.slice(dataIdx + 6, dataLineEnd);
 
+            const idxMatch = dataStr.match(/"index":(\d+)/);
+            const blockIndex = idxMatch ? parseInt(idxMatch[1]) : -1;
+
             if (dataStr.indexOf('"type":"content_block_start"') !== -1) {
-              if (dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
-                  dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1) {
-                currentBlockIsThinking = true;
-                return event; // pass through unchanged
-              }
-              currentBlockIsThinking = false;
-              return reverseMap(event, config);
+              const isThinking =
+                dataStr.indexOf('"content_block":{"type":"thinking"') !== -1 ||
+                dataStr.indexOf('"content_block":{"type":"redacted_thinking"') !== -1;
+              blockStates.set(blockIndex, { isThinking, pendingRaw: '', emittedLen: 0, valueKey: null });
+              return isThinking ? event : reverseMap(event, config);
             }
+
+            if (dataStr.indexOf('"type":"content_block_delta"') !== -1) {
+              const state = blockStates.get(blockIndex);
+              if (!state) return reverseMap(event, config);
+              if (state.isThinking) return event; // byte-identical passthrough
+
+              const extracted = extractDeltaValue(dataStr);
+              if (!extracted) return reverseMap(event, config); // unknown delta shape
+
+              if (!state.valueKey) state.valueKey = extracted.key;
+              state.pendingRaw += extracted.value;
+
+              const reversed = reverseMap(state.pendingRaw, config);
+              const safeLen = safeSplitPoint(
+                reversed,
+                reversed.length - HOLDBACK,
+                state.emittedLen
+              );
+              const newEmit = reversed.slice(state.emittedLen, safeLen);
+              state.emittedLen = safeLen;
+
+              // In-place replace of the delta field within the event. Use
+              // indexOf on the exact original substring (quoted field name +
+              // raw captured value) to avoid collisions elsewhere in the event.
+              const origField = `"${extracted.key}":"${extracted.value}"`;
+              const newField = `"${extracted.key}":"${newEmit}"`;
+              const at = event.indexOf(origField);
+              if (at === -1) return reverseMap(event, config); // shouldn't happen
+              return event.slice(0, at) + newField + event.slice(at + origField.length);
+            }
+
             if (dataStr.indexOf('"type":"content_block_stop"') !== -1) {
-              const wasThinking = currentBlockIsThinking;
-              currentBlockIsThinking = false;
-              return wasThinking ? event : reverseMap(event, config);
+              const state = blockStates.get(blockIndex);
+              blockStates.delete(blockIndex);
+              if (!state || state.isThinking) return state && state.isThinking ? event : reverseMap(event, config);
+
+              // Flush any unemitted reversed tail as a synthetic delta event
+              // before the stop event, so the client's accumulated string
+              // matches the full reversed content.
+              const reversed = reverseMap(state.pendingRaw, config);
+              const remaining = reversed.slice(state.emittedLen);
+              if (remaining.length === 0) return reverseMap(event, config);
+
+              const valueKey = state.valueKey || 'text';
+              const deltaType = valueKey === 'partial_json' ? 'input_json_delta' : 'text_delta';
+              const flushData = `{"type":"content_block_delta","index":${blockIndex},"delta":{"type":"${deltaType}","${valueKey}":"${remaining}"}}`;
+              const flushEvent = `event: content_block_delta\ndata: ${flushData}\n\n`;
+              return flushEvent + reverseMap(event, config);
             }
-            if (currentBlockIsThinking) {
-              // thinking_delta / signature_delta / etc. inside a thinking block
-              return event;
-            }
+
+            // message_start, message_delta, ping, error, etc. — no streaming
+            // content splits, safe to reverseMap as a whole.
             return reverseMap(event, config);
           };
 
@@ -931,12 +1099,44 @@ function startServer(config) {
         }
       });
       upstream.on('error', e => {
+        metricsLib.recordUpstreamError(metrics);
         console.error(`[${ts}] #${reqNum} ERR: ${e.message}`);
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { message: e.message } }));
+        } else {
+          // Headers already sent (mid-stream) — can't change status. Just end.
+          try { res.end(); } catch (_) {}
         }
       });
+
+      // Upstream socket idle past timeout: abort cleanly. The 'error' handler
+      // above will fire with a socket-hang-up-style error and convert to 504
+      // for the client (or no-op if we'd already written headers).
+      upstream.on('timeout', () => {
+        console.error(`[${ts}] #${reqNum} UPSTREAM_TIMEOUT after ${config.upstreamTimeoutMs}ms`);
+        metricsLib.recordUpstreamError(metrics);
+        upstream.destroy(new Error('upstream timeout'));
+        if (!res.headersSent) {
+          res.writeHead(504, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { message: 'upstream timeout' } }));
+        }
+      });
+
+      // Client went away — abort the upstream request so we don't continue
+      // burning quota writing to a dead socket. Without this, long SSE
+      // streams keep consuming Anthropic tokens after the client disconnects.
+      //
+      // Gate: only react when the response hasn't been fully written yet.
+      // `res.on('close')` fires on BOTH normal completion AND premature
+      // client termination — `writableEnded` distinguishes them.
+      res.once('close', () => {
+        if (!res.writableEnded && !upstream.destroyed) {
+          console.log(`[${ts}] #${reqNum} client disconnected, aborting upstream`);
+          upstream.destroy();
+        }
+      });
+
       upstream.write(body);
       upstream.end();
     });
@@ -974,6 +1174,31 @@ function startServer(config) {
   process.on('SIGTERM', () => process.exit(0));
 }
 
+// ─── Exports (for tests) ────────────────────────────────────────────────────
+// Exported so tests can exercise the pure transform pipeline without booting
+// the HTTP server. Do not rely on these from other runtime callers.
+module.exports = {
+  CC_TOOL_STUBS,
+  DEFAULT_REPLACEMENTS,
+  DEFAULT_TOOL_RENAMES,
+  DEFAULT_PROP_RENAMES,
+  DEFAULT_REVERSE_MAP,
+  REQUIRED_BETAS,
+  VERSION,
+  processBody,
+  reverseMap,
+  maskThinkingBlocks,
+  unmaskThinkingBlocks,
+  findMatchingBracket,
+  computeBillingFingerprint,
+  extractFirstUserText,
+  metrics: metricsLib
+};
+
 // ─── Main ───────────────────────────────────────────────────────────────────
-const config = loadConfig();
-startServer(config);
+// Only auto-start the server when invoked as a script (node proxy.js).
+// Allows `require('./proxy')` from test files without side effects.
+if (require.main === module) {
+  const config = loadConfig();
+  startServer(config);
+}

@@ -68,16 +68,83 @@ https.request = function (options, cb) {
   const chunks = [];
   const origWrite = req.write.bind(req);
   const origEnd = req.end.bind(req);
+
+  // Fix stale content block types that upstream deliberately removed from
+  // tool renames (proxy.js issue #14). OpenClaw may cache renamed types
+  // from earlier conversations and resend them as content block "type" values.
+  // Anthropic rejects unknown types, so we patch them just before send.
+  const CONTENT_TYPE_FIXES = [
+    ['"ImageGen"', '"image"'],
+  ];
+
+  // Strip orphaned tool_results whose tool_use_id has no matching tool_use
+  // in the previous assistant message. OpenClaw's context compaction can merge
+  // hundreds of tool_results into one user message while losing the assistant
+  // tool_use blocks they reference. Anthropic rejects these with:
+  //   "unexpected tool_use_id found in tool_result blocks"
+  function stripOrphanedToolResults(body) {
+    const msgs = body.messages;
+    if (!Array.isArray(msgs)) return false;
+    let changed = false;
+    for (let i = 1; i < msgs.length; i++) {
+      const content = msgs[i].content;
+      if (!Array.isArray(content)) continue;
+      // Collect tool_use ids from previous message
+      const prev = msgs[i - 1].content;
+      const validIds = new Set();
+      if (Array.isArray(prev)) {
+        for (const b of prev) {
+          if (b.type === 'tool_use' && b.id) validIds.add(b.id);
+        }
+      }
+      // Filter out tool_results with no matching tool_use
+      const filtered = content.filter(b => {
+        if (b.type !== 'tool_result') return true;
+        return validIds.has(b.tool_use_id);
+      });
+      if (filtered.length < content.length) {
+        const removed = content.length - filtered.length;
+        console.log(`[patch] Stripped ${removed} orphaned tool_result(s) from msg[${i}]`);
+        msgs[i].content = filtered.length > 0 ? filtered : [{ type: 'text', text: '(compacted)' }];
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  function patchBody(bodyStr) {
+    let patched = bodyStr;
+    // Fix stale content block types
+    for (const [bad, good] of CONTENT_TYPE_FIXES) {
+      patched = patched.split(bad).join(good);
+    }
+    // Fix orphaned tool_results (requires JSON parse)
+    try {
+      const body = JSON.parse(patched);
+      if (stripOrphanedToolResults(body)) {
+        patched = JSON.stringify(body);
+      }
+    } catch (_) {}
+    return patched;
+  }
+
   req.write = function (chunk, ...rest) {
+    // Buffer chunks — we may need to patch the body before sending
     if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    return origWrite(chunk, ...rest);
+    // Suppress encoding arg, return true to signal writable
+    return true;
   };
   req.end = function (chunk, ...rest) {
     if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    try {
-      logPrompt(options.method, options.path, Buffer.concat(chunks).toString('utf8'));
-    } catch (_) {}
-    return origEnd(chunk, ...rest);
+    const bodyStr = Buffer.concat(chunks).toString('utf8');
+    try { logPrompt(options.method, options.path, bodyStr); } catch (_) {}
+
+    // Apply content type fixes and send as single chunk
+    const fixed = patchBody(bodyStr);
+    const buf = Buffer.from(fixed, 'utf8');
+    req.setHeader('content-length', buf.length);
+    origWrite(buf);
+    return origEnd(null, ...rest);
   };
   return req;
 };
